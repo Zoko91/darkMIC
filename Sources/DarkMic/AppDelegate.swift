@@ -38,14 +38,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.ledController = controller
         self.statusBar = bar
 
-        // Lightweight 60s check (20s coalescing tolerance) to catch silent headset reconnects
-        // or firmware mode resets; only writes LED frames if needed.
-        resyncTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+        // Lightweight 30s heartbeat + state check (10s coalescing tolerance):
+        // keeps Bragi Software Mode alive (prevents the ~15 min firmware watchdog from reverting
+        // to Hardware Mode) and detects silent headset power-on / power-off.
+        resyncTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
-                self?.ledController?.sync(force: false)
+                guard let controller = self?.ledController else { return }
+                if controller.isEnabled {
+                    controller.sendHeartbeat()
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+                    controller.sync(force: false)
+                }
             }
         }
-        resyncTimer?.tolerance = 20
+        resyncTimer?.tolerance = 10
 
         let wsCenter = NSWorkspace.shared.notificationCenter
         let events: [NSNotification.Name] = [

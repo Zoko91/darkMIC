@@ -16,12 +16,14 @@ final class CorsairLedController {
     private static let usagePage = 0xFF42
 
     private static let reportLength = 64
+    private static let routeRoot: UInt8 = 0x08
     private static let routeChild: UInt8 = 0x09
     private static let cmdSet: UInt8 = 0x01
     private static let cmdGet: UInt8 = 0x02
     private static let cmdCloseHandle: UInt8 = 0x05
     private static let cmdWriteData: UInt8 = 0x06
     private static let cmdOpenHandle: UInt8 = 0x0D
+    private static let cmdHeartbeat: UInt8 = 0x12
 
     private static let propMode: UInt8 = 0x03
     private static let propBatteryLevel: UInt8 = 0x0F
@@ -130,6 +132,17 @@ final class CorsairLedController {
             forceNextApply = true
         }
         queryMicMuteState()
+    }
+
+    /// Sends the Bragi 0x12 keepalive heartbeat to both dongle (0x08) and headset (0x09)
+    /// so the headset's Software Mode watchdog (~15 min) never times out and reverts to Hardware Mode.
+    func sendHeartbeat() {
+        guard device != nil else { return }
+        sendReport(Self.makeFrame([0x02, Self.routeRoot, Self.cmdHeartbeat]))
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.055) { [weak self] in
+            guard let self, self.device != nil else { return }
+            self.sendReport(Self.makeFrame([0x02, Self.routeChild, Self.cmdHeartbeat]))
+        }
     }
 
     private func attachDevice(_ dev: IOHIDDevice) {
