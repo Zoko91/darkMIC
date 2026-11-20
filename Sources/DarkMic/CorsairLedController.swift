@@ -24,14 +24,23 @@ final class CorsairLedController {
     private static let cmdOpenHandle: UInt8 = 0x0D
 
     private static let propMode: UInt8 = 0x03
+    private static let propBatteryLevel: UInt8 = 0x0F
+    private static let propChargeState: UInt8 = 0x10
+    private static let propSubdevices: UInt8 = 0x36
     private static let propMicMute: UInt8 = 0xA6
+
+    private enum PendingQuery {
+        case micMute
+        case lightingMode(muted: Bool)
+    }
 
     private let manager: IOHIDManager
     private var device: IOHIDDevice?
     private var reportBuffer: UnsafeMutableBufferPointer<UInt8>?
 
     private var pendingWorkItems: [DispatchWorkItem] = []
-    private var awaitingMicQuery = false
+    private var reconnectConfirmWorkItem: DispatchWorkItem?
+    private var pendingQuery: PendingQuery?
     private var forceNextApply = true
     private var lastAppliedMuted: Bool?
     private var lastCommandFailed = false
@@ -82,6 +91,8 @@ final class CorsairLedController {
 
     func stop() {
         cancelPendingWork()
+        reconnectConfirmWorkItem?.cancel()
+        reconnectConfirmWorkItem = nil
         if let dev = device {
             IOHIDDeviceClose(dev, IOOptionBits(kIOHIDOptionsTypeNone))
             device = nil
@@ -107,7 +118,12 @@ final class CorsairLedController {
             return
         }
         if !isEnabled {
-            restoreHardwareMode()
+            if force {
+                restoreHardwareMode()
+            } else {
+                // Still check online/offline so the menu bar icon tracks headset power
+                queryMicMuteState()
+            }
             return
         }
         if force {
@@ -150,21 +166,39 @@ final class CorsairLedController {
     private func detachDevice(_ dev: IOHIDDevice) {
         guard let current = device, CFEqual(current, dev) else { return }
         cancelPendingWork()
+        reconnectConfirmWorkItem?.cancel()
+        reconnectConfirmWorkItem = nil
         IOHIDDeviceClose(current, IOOptionBits(kIOHIDOptionsTypeNone))
         device = nil
         reportBuffer?.deallocate()
         reportBuffer = nil
         lastAppliedMuted = nil
-        awaitingMicQuery = false
+        pendingQuery = nil
         status = .receiverDisconnected
     }
 
     private func queryMicMuteState() {
-        awaitingMicQuery = true
+        pendingQuery = .micMute
         sendReport(Self.makeFrame([0x02, Self.routeChild, Self.cmdGet, Self.propMicMute]))
     }
 
-    private func applyMicLed(muted: Bool) {
+    private func queryLightingMode(muted: Bool) {
+        pendingQuery = .lightingMode(muted: muted)
+        sendReport(Self.makeFrame([0x02, Self.routeChild, Self.cmdGet, Self.propMode]))
+    }
+
+    private func scheduleReconnectConfirmation() {
+        reconnectConfirmWorkItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self, self.isEnabled else { return }
+            self.sync(force: true)
+        }
+        reconnectConfirmWorkItem = item
+        // Re-assert LED off 2 seconds after headset powers on in case firmware boot overrides it
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0, execute: item)
+    }
+
+    private func applyMicLed(muted: Bool, wasOffline: Bool) {
         cancelPendingWork()
 
         let micR: UInt8 = muted ? 0xFF : 0x00
@@ -215,17 +249,22 @@ final class CorsairLedController {
                 self.lastAppliedMuted = muted
                 self.forceNextApply = false
                 self.status = muted ? .mutedRedLed : .liveLedOff
+                if wasOffline {
+                    self.scheduleReconnectConfirmation()
+                }
             }
         }
         pendingWorkItems.append(finishItem)
         DispatchQueue.main.asyncAfter(
-            deadline: .now() + spacing * Double(frames.count - 1) + 0.12,
+            deadline: .now() + spacing * Double(frames.count - 1) + 0.2,
             execute: finishItem
         )
     }
 
     private func restoreHardwareMode() {
         cancelPendingWork()
+        reconnectConfirmWorkItem?.cancel()
+        reconnectConfirmWorkItem = nil
         lastCommandFailed = false
         lastCommandSucceeded = false
         sendReport(Self.makeFrame([0x02, Self.routeChild, Self.cmdSet, Self.propMode, 0x00, 0x01]))
@@ -240,7 +279,7 @@ final class CorsairLedController {
             }
         }
         pendingWorkItems.append(finishItem)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: finishItem)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: finishItem)
     }
 
     private func cancelPendingWork() {
@@ -264,43 +303,73 @@ final class CorsairLedController {
     }
 
     private func handleReport(_ bytes: UnsafeBufferPointer<UInt8>) {
-        guard bytes.count >= 5 else { return }
+        guard bytes.count >= 6 else { return }
 
-        // Unsolicited notification from headset:
-        // Report ID 0x03 ([0x03, 0x01, 0x01, propID, 0x00, val])
-        // or async push ([0x01, 0x01, 0x01, propID, val, ...])
-        let isNotification =
-            (bytes[0] == 0x03 && bytes[1] == 0x01 && bytes[2] == 0x01) ||
-            (bytes[0] == 0x01 && bytes[1] == 0x01 && bytes[2] == 0x01)
+        // Unsolicited notifications:
+        // - Report ID 0x03: [0x03, 0x01, 0x01, propID, 0x00, val]
+        // - Async push on Report ID 0x01: [0x01, 0x01, 0x01, propID, valLo, valHi]
+        //   (Distinguished from cmdSet ACK [0x01, 0x01, 0x01, err] by checking known property IDs)
+        let knownNotificationProps: Set<UInt8> = [
+            Self.propMicMute,
+            Self.propBatteryLevel,
+            Self.propChargeState,
+            Self.propSubdevices
+        ]
+        let isReport3Notification = (bytes[0] == 0x03 && bytes[1] == 0x01 && bytes[2] == 0x01)
+        let isAsyncPushNotification = (bytes[0] == 0x01 && bytes[1] == 0x01 && bytes[2] == 0x01 && knownNotificationProps.contains(bytes[3]))
 
-        if isNotification {
+        if isReport3Notification || isAsyncPushNotification {
             let propID = bytes[3]
             if isEnabled && propID == Self.propMicMute {
-                // Immediately query authoritative state and switch between Off (live) / Red (muted)
                 forceNextApply = true
                 queryMicMuteState()
-            } else if status == .headsetOffline {
+            } else if status == .headsetOffline || status == .receiverDisconnected {
                 // Headset just came back online
                 sync(force: true)
             }
             return
         }
 
-        // Command response from subdevice 1: [0x01, 0x01, cmd, err, val...]
+        // Command response from subdevice 1: [0x01, 0x01, cmd, err, valLo, valHi...]
         guard bytes[0] == 0x01, bytes[1] == 0x01 else { return }
         let cmd = bytes[2]
         let err = bytes[3]
 
-        if cmd == Self.cmdGet && awaitingMicQuery {
-            awaitingMicQuery = false
+        if cmd == Self.cmdGet, let query = pendingQuery {
+            // Ignore responses from other apps (e.g. PowerLevel querying 16-bit battery 0x0F)
+            // when the payload does not look like a boolean/mode byte (0x00..0x02 with high byte 0x00).
+            if err == 0x00 && (bytes[4] > 0x02 || bytes[5] != 0x00) {
+                return
+            }
+
+            pendingQuery = nil
             guard err == 0x00 else {
                 lastAppliedMuted = nil
                 status = .headsetOffline
                 return
             }
-            let muted = bytes[4] != 0x00
-            if forceNextApply || lastAppliedMuted != muted || status == .headsetOffline {
-                applyMicLed(muted: muted)
+
+            let wasOffline = (status == .headsetOffline || status == .receiverDisconnected)
+
+            switch query {
+            case .micMute:
+                let muted = bytes[4] != 0x00
+                if !isEnabled {
+                    status = .hardwareMode
+                    return
+                }
+                if forceNextApply || lastAppliedMuted != muted || wasOffline {
+                    applyMicLed(muted: muted, wasOffline: wasOffline)
+                } else {
+                    // Verify headset didn't silently revert to hardware mode (0x01)
+                    queryLightingMode(muted: muted)
+                }
+
+            case .lightingMode(let muted):
+                let mode = bytes[4]
+                if mode != 0x02 {
+                    applyMicLed(muted: muted, wasOffline: false)
+                }
             }
             return
         }

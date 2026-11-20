@@ -38,12 +38,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.ledController = controller
         self.statusBar = bar
 
-        // Lightweight 60s check (20s coalescing tolerance) to catch silent headset reconnects;
-        // only writes LED frames if state changed or headset came back online.
+        // Lightweight 60s check (20s coalescing tolerance) to catch silent headset reconnects
+        // or firmware mode resets; only writes LED frames if needed.
         resyncTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
-                guard let controller = self?.ledController, controller.isEnabled else { return }
-                controller.sync(force: false)
+                self?.ledController?.sync(force: false)
             }
         }
         resyncTimer?.tolerance = 20
@@ -57,13 +56,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         observers = events.map { name in
             wsCenter.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
                 MainActor.assumeIsolated {
-                    guard let controller = self?.ledController, controller.isEnabled else { return }
-                    controller.sync(force: true)
+                    self?.ledController?.sync(force: true)
                 }
             }
         }
 
         controller.sync(force: true)
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        ledController?.sync(force: true)
+        return false
     }
 
     func applicationWillTerminate(_ notification: Notification) {
