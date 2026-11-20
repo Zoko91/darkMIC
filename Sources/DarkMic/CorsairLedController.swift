@@ -279,10 +279,9 @@ final class CorsairLedController {
                 // Immediately query authoritative state and switch between Off (live) / Red (muted)
                 forceNextApply = true
                 queryMicMuteState()
-            } else if isEnabled && status == .headsetOffline {
+            } else if status == .headsetOffline {
                 // Headset just came back online
-                forceNextApply = true
-                queryMicMuteState()
+                sync(force: true)
             }
             return
         }

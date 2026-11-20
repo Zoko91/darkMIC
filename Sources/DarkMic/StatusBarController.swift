@@ -54,10 +54,11 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     }
 
     private func renderIcon() {
-        guard let button = statusItem.button else { return }
-        button.image = isEnabled ? iconOff : iconOn
         let isOnline = status == .liveLedOff || status == .mutedRedLed || status == .hardwareMode
-        button.alphaValue = isOnline ? 1.0 : 0.45
+        statusItem.isVisible = isOnline
+        guard isOnline, let button = statusItem.button else { return }
+        button.image = isEnabled ? iconOff : iconOn
+        button.alphaValue = 1.0
     }
 
     // MARK: - NSMenuDelegate
