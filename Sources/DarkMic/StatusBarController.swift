@@ -1,7 +1,7 @@
 import AppKit
 
 final class StatusBarController: NSObject, NSMenuDelegate {
-    private let statusItem: NSStatusItem
+    private var statusItem: NSStatusItem?
     private let menu = NSMenu()
 
     private let onToggleEnabled: (Bool) -> Void
@@ -27,7 +27,6 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         self.isEnabled = initialEnabled
         self.onToggleEnabled = onToggleEnabled
         self.onApplyNow = onApplyNow
-        self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
 
         let config = NSImage.SymbolConfiguration(pointSize: 13.5, weight: .medium)
         let offImg = NSImage(systemSymbolName: "mic.slash", accessibilityDescription: "DarkMic Active")?
@@ -43,7 +42,6 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         super.init()
 
         self.menu.delegate = self
-        self.statusItem.menu = menu
         renderIcon()
     }
 
@@ -55,8 +53,25 @@ final class StatusBarController: NSObject, NSMenuDelegate {
 
     private func renderIcon() {
         let isOnline = status == .liveLedOff || status == .mutedRedLed || status == .hardwareMode
-        statusItem.isVisible = isOnline
-        guard isOnline, let button = statusItem.button else { return }
+        if !isOnline {
+            if let existing = statusItem {
+                NSStatusBar.system.removeStatusItem(existing)
+                statusItem = nil
+            }
+            return
+        }
+
+        let item: NSStatusItem
+        if let existing = statusItem {
+            item = existing
+        } else {
+            let created = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+            created.menu = menu
+            statusItem = created
+            item = created
+        }
+
+        guard let button = item.button else { return }
         button.image = isEnabled ? iconOff : iconOn
         button.alphaValue = 1.0
     }

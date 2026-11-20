@@ -42,6 +42,7 @@ final class CorsairLedController {
 
     private var pendingWorkItems: [DispatchWorkItem] = []
     private var reconnectConfirmWorkItem: DispatchWorkItem?
+    private var queryTimeoutWorkItem: DispatchWorkItem?
     private var pendingQuery: PendingQuery?
     private var forceNextApply = true
     private var lastAppliedMuted: Bool?
@@ -95,6 +96,8 @@ final class CorsairLedController {
         cancelPendingWork()
         reconnectConfirmWorkItem?.cancel()
         reconnectConfirmWorkItem = nil
+        queryTimeoutWorkItem?.cancel()
+        queryTimeoutWorkItem = nil
         if let dev = device {
             IOHIDDeviceClose(dev, IOOptionBits(kIOHIDOptionsTypeNone))
             device = nil
@@ -178,11 +181,19 @@ final class CorsairLedController {
 
     private func detachDevice(_ dev: IOHIDDevice) {
         guard let current = device, CFEqual(current, dev) else { return }
+        forceDetachCurrentDevice()
+    }
+
+    private func forceDetachCurrentDevice() {
         cancelPendingWork()
         reconnectConfirmWorkItem?.cancel()
         reconnectConfirmWorkItem = nil
-        IOHIDDeviceClose(current, IOOptionBits(kIOHIDOptionsTypeNone))
-        device = nil
+        queryTimeoutWorkItem?.cancel()
+        queryTimeoutWorkItem = nil
+        if let current = device {
+            IOHIDDeviceClose(current, IOOptionBits(kIOHIDOptionsTypeNone))
+            device = nil
+        }
         reportBuffer?.deallocate()
         reportBuffer = nil
         lastAppliedMuted = nil
@@ -192,12 +203,26 @@ final class CorsairLedController {
 
     private func queryMicMuteState() {
         pendingQuery = .micMute
+        armQueryTimeout()
         sendReport(Self.makeFrame([0x02, Self.routeChild, Self.cmdGet, Self.propMicMute]))
     }
 
     private func queryLightingMode(muted: Bool) {
         pendingQuery = .lightingMode(muted: muted)
+        armQueryTimeout()
         sendReport(Self.makeFrame([0x02, Self.routeChild, Self.cmdGet, Self.propMode]))
+    }
+
+    private func armQueryTimeout() {
+        queryTimeoutWorkItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self, self.pendingQuery != nil else { return }
+            self.pendingQuery = nil
+            self.lastAppliedMuted = nil
+            self.status = .headsetOffline
+        }
+        queryTimeoutWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: item)
     }
 
     private func scheduleReconnectConfirmation() {
@@ -304,14 +329,17 @@ final class CorsairLedController {
 
     private func sendReport(_ frame: [UInt8]) {
         guard let dev = device else { return }
-        frame.withUnsafeBytes { raw in
-            _ = IOHIDDeviceSetReport(
+        let ret: IOReturn = frame.withUnsafeBytes { raw in
+            IOHIDDeviceSetReport(
                 dev,
                 kIOHIDReportTypeOutput,
                 CFIndex(0x02),
                 raw.baseAddress!.assumingMemoryBound(to: UInt8.self),
                 frame.count
             )
+        }
+        if ret != kIOReturnSuccess {
+            forceDetachCurrentDevice()
         }
     }
 
@@ -356,6 +384,8 @@ final class CorsairLedController {
             }
 
             pendingQuery = nil
+            queryTimeoutWorkItem?.cancel()
+            queryTimeoutWorkItem = nil
             guard err == 0x00 else {
                 lastAppliedMuted = nil
                 status = .headsetOffline
@@ -384,6 +414,12 @@ final class CorsairLedController {
                     applyMicLed(muted: muted, wasOffline: false)
                 }
             }
+            return
+        }
+
+        if cmd == Self.cmdHeartbeat && err != 0x00 {
+            lastAppliedMuted = nil
+            status = .headsetOffline
             return
         }
 
